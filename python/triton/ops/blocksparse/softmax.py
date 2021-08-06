@@ -27,12 +27,12 @@ def num_warps(n):
 
 
 @triton.heuristics(
-    {"num_warps": lambda *args, **meta: num_warps(args[5] * meta["BLOCK_SIZE_M"])}
+    {"num_warps": lambda *args, **meta: num_warps(args[5] * meta["SPARSE_BLOCK_SIZE"])}
 )
 @triton.heuristics(
     {
-        "BLOCK_SIZE_N": lambda *args, **meta: next_power_of_2(
-            args[5] * meta["BLOCK_SIZE_M"]
+        "MAX_N_COLS": lambda *args, **meta: next_power_of_2(
+            args[5] * meta["SPARSE_BLOCK_SIZE"]
         )
     }
 )
@@ -53,70 +53,73 @@ def softmax_forward_kernel(
     stride_batch_attn_mask,
     **meta,
 ):
-    BLOCK_SIZE_N = meta["BLOCK_SIZE_N"]
-    BLOCK_SIZE_M = meta["BLOCK_SIZE_M"]
-    # We parallelize across both the batch and the row dimensions
-    pid_head_row = tl.program_id(0)
+    MAX_N_COLS = meta["MAX_N_COLS"]
+    SPARSE_BLOCK_SIZE = meta["SPARSE_BLOCK_SIZE"]
+    # TODO: Understand and rename everything from here to rbmn
+    pid_row = tl.program_id(0)
     pid_batch = tl.program_id(1)
     # create index ranges
-    rxm = pid_head_row % BLOCK_SIZE_M
-    rbm = pid_head_row // BLOCK_SIZE_M
-    rxn = tl.arange(0, BLOCK_SIZE_N) % BLOCK_SIZE_M
-    rbn = tl.arange(0, BLOCK_SIZE_N) // BLOCK_SIZE_M
+    row_in_sparse_block = pid_row % SPARSE_BLOCK_SIZE
+    sparse_block_id = pid_row // SPARSE_BLOCK_SIZE
+    rxn = tl.arange(0, MAX_N_COLS) % SPARSE_BLOCK_SIZE
+    rbn = tl.arange(0, MAX_N_COLS) // SPARSE_BLOCK_SIZE
     # extract information from LUT
-    header = lut_ptr + rbm * 2
+    header = lut_ptr + sparse_block_id * 2
     size = tl.load(header + 0)
     offset = tl.load(header + 1)
     check = rbn < size
     rbmn = tl.where(check, rbn, size - 1)
-    # block id and column id
-    blockid = tl.load(lut_ptr + offset + rbmn * 4 + 0)
-    columnid = tl.load(lut_ptr + offset + rbmn * 4 + 1)
-    rowid = tl.load(lut_ptr + offset + rbmn * 4 + 2)
-    # pointers to X
-    px = (
+
+    block_id = tl.load(lut_ptr + offset + rbmn * 4 + 0)
+    column_id = tl.load(lut_ptr + offset + rbmn * 4 + 1)
+    row_id = tl.load(lut_ptr + offset + rbmn * 4 + 2)
+    input_ptrs = (
         input_ptr
         + pid_batch * stride_batch_x
-        + blockid * BLOCK_SIZE_M * BLOCK_SIZE_M
-        + rxm * BLOCK_SIZE_M
+        + block_id * SPARSE_BLOCK_SIZE * SPARSE_BLOCK_SIZE
+        + row_in_sparse_block * SPARSE_BLOCK_SIZE
         + rxn
     )
-    x = tl.load(px, mask=check, other=-float("inf"))
+    inputs = tl.load(input_ptrs, mask=check, other=-float("inf"))
     # This was a suggestion from Philippe. We are unsure if it improves performance
     # or not. Seems inconsistent. It may need to go in another place.
-    x = tl.multiple_of(x, 8)  # compiler hint
-    x = x.to(tl.float32)
-    # apply scale
+    inputs = tl.multiple_of(inputs, 8)  # compiler hint
+    inputs = inputs.to(tl.float32)
+    # TODO: See if this needs to be hidden behind a flag
     if meta["APPLY_SCALE"]:
-        x = x * scale
-    # apply key-padding mask
+        inputs = inputs * scale
     if meta["APPLY_KP_MASK"]:
-        pkp_m = (
+        key_padding_mask_ptr = (
             key_padding_mask
             + pid_batch * stride_batch_key_padding_mask
-            + columnid * BLOCK_SIZE_M
+            + column_id * SPARSE_BLOCK_SIZE
             + rxn
         )
-        kp_m = tl.load(pkp_m, mask=check, other=-float("inf"))
+        key_padding_mask = tl.load(
+            key_padding_mask_ptr, mask=check, other=-float("inf")
+        )
         if meta["KP_MASK_MUL"]:
-            kp_m = tl.where(kp_m == 0, -float("inf"), 0.0)
-        x = x + kp_m
+            key_padding_mask = tl.where(key_padding_mask == 0, -float("inf"), 0.0)
+        inputs = inputs + key_padding_mask
     # apply attention mask
     if meta["APPLY_ATTN_MASK"]:
-        pattn_m = (
+        attn_mask_ptr = (
             attention_mask
-            + columnid * BLOCK_SIZE_M
-            + rowid * BLOCK_SIZE_M * stride_batch_attn_mask
-            + rxm * stride_batch_attn_mask
+            + column_id * SPARSE_BLOCK_SIZE
+            + row_id * SPARSE_BLOCK_SIZE * stride_batch_attn_mask
+            + row_in_sparse_block * stride_batch_attn_mask
             + rxn
         )
-        attn_m = tl.load(pattn_m, mask=check, other=-float("inf"))
+        attn_m = tl.load(attn_mask_ptr, mask=check, other=-float("inf"))
+        # TODO: See if this (and kp_mask) are ever off. Would be simpler to just require
+        # that the mask is a bool mask.
         if meta["ATTN_MASK_MUL"]:
             attn_m = tl.where(attn_m == 0, -float("inf"), 0.0)
-        x = x + attn_m
+        inputs = inputs + attn_m
     # computation
-    x = tl.softmax(x)
-    tl.store(px, x, mask=check)
+    probs = tl.softmax(inputs)
+    # Op is in-place, we write back to the same memory location
+    tl.store(input_ptrs, probs, mask=check)
 
 
 @triton.heuristics(
@@ -156,60 +159,6 @@ def softmax_backward_kernel(X, scale, DX, LUT, sizemax, stride_zx, stride_zdx, *
     tl.store(DX, y, mask=check)
 
 
-# @triton.heuristics(
-#     {"num_warps": lambda *args, **meta: num_warps(args[4] * meta["BLOCK_SIZE_M"])}
-# )
-# @triton.heuristics(
-#     {
-#         "BLOCK_SIZE_N": lambda X, scale, DX, LUT, sizemax, *_, **meta: next_power_of_2(
-#             sizemax
-#         )
-#         * meta["BLOCK_SIZE_M"]
-#     }
-# )
-# @triton.jit
-# def softmax_backward_kernel(X, scale, DX, LUT, sizemax, stride_zx, stride_zdx, **meta):
-#     pidhm = tl.program_id(0)
-#     pidz = tl.program_id(1)
-#     BLOCK_SIZE_N = meta["BLOCK_SIZE_N"]
-#     BLOCK_SIZE_M = meta["BLOCK_SIZE_M"]
-#     # create index ranges
-#     rxm = pidhm % BLOCK_SIZE_M
-#     rbm = pidhm // BLOCK_SIZE_M
-#     rxn = tl.arange(0, BLOCK_SIZE_N) % BLOCK_SIZE_M
-#     rbn = tl.arange(0, BLOCK_SIZE_N) // BLOCK_SIZE_M
-#     # extract information from look-up table
-#     header = LUT + rbm * 2
-#     size = tl.load(header + 0)
-#     offset = tl.load(header + 1)
-#     # bounds checking on lut
-#     check = rbn < size
-#     rbmn = tl.where(check, rbn, size - 1)
-#     # initialize pointers to block_size-sparse input
-#     block_id = tl.load(LUT + offset + rbmn * 4)
-#     X = (
-#         X
-#         + pidz * stride_zx
-#         + block_id * BLOCK_SIZE_M * BLOCK_SIZE_M
-#         + rxm * BLOCK_SIZE_M
-#         + rxn
-#     )
-#     DX = (
-#         DX
-#         + pidz * stride_zdx
-#         + block_id * BLOCK_SIZE_M * BLOCK_SIZE_M
-#         + rxm * BLOCK_SIZE_M
-#         + rxn
-#     )
-#     # compute fused softmax backward
-#     x = tl.load(X, mask=check, other=0)
-#     dx = tl.load(DX, mask=check, other=0)
-#     x = x.to(tl.float32)
-#     dx = dx.to(tl.float32)
-#     y = x * (dx - tl.sum(x * dx, 0)) * scale
-#     tl.store(DX, y, mask=check)
-
-
 class BlocksparseSoftmaxFunction(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -220,7 +169,7 @@ class BlocksparseSoftmaxFunction(torch.autograd.Function):
         attn_mask,
         kp_mask_mode,
         attn_mask_mode,
-        block_size,
+        sparse_block_size,
         lut,
         maxlut,
         n_heads,
@@ -243,16 +192,16 @@ class BlocksparseSoftmaxFunction(torch.autograd.Function):
 
         # run kernel
         n_batch, n_blocks, block_size_1, block_size_2 = x.shape
-        assert block_size == block_size_1 == block_size_2
+        assert sparse_block_size == block_size_1 == block_size_2
         meta = {
-            "BLOCK_SIZE_M": block_size,
+            "SPARSE_BLOCK_SIZE": sparse_block_size,
             "APPLY_SCALE": scale != 1.0,
             "APPLY_KP_MASK": key_padding_mask is not None,
             "APPLY_ATTN_MASK": attn_mask is not None,
             "KP_MASK_MUL": kp_mask_mode == "mul",
             "ATTN_MASK_MUL": attn_mask_mode == "mul",
         }
-        grid = lambda opt: [n_heads * n_rows * block_size, n_batch]
+        grid = lambda opt: [n_heads * n_rows, n_batch]
         softmax_forward_kernel[grid](
             x,
             scale,
@@ -270,7 +219,7 @@ class BlocksparseSoftmaxFunction(torch.autograd.Function):
         # save to context
         ctx.mark_dirty(x)
         ctx.save_for_backward(x, lut)
-        ctx.block_size = block_size
+        ctx.sparse_block_size = sparse_block_size
         ctx.n_heads = n_heads
         ctx.n_rows = n_rows
         ctx.maxlut = maxlut
@@ -285,7 +234,7 @@ class BlocksparseSoftmaxFunction(torch.autograd.Function):
         x, lut = ctx.saved_tensors
         # run kernel
         M = x.shape[0]
-        grid = lambda opt: [ctx.n_heads * ctx.n_rows * ctx.block_size, M]
+        grid = lambda opt: [ctx.n_heads * ctx.n_rows, M]
         softmax_backward_kernel[grid](
             x,
             ctx.scale,
@@ -295,7 +244,7 @@ class BlocksparseSoftmaxFunction(torch.autograd.Function):
             x.stride(0),
             dx.stride(0),
             force_nc_cache=True,
-            BLOCK=ctx.block_size,
+            BLOCK=ctx.sparse_block_size,
         )
         return (
             dx,
@@ -315,46 +264,6 @@ class BlocksparseSoftmaxFunction(torch.autograd.Function):
             None,
         )
 
-    # @staticmethod
-    # def backward(ctx, dx):
-    #     # retrieve from context
-    #     x, lut = ctx.saved_tensors
-    #     # run kernel
-    #     M = x.shape[0]
-    #     n_heads, n_rows = ctx.n_heads, ctx.n_rows
-    #     grid = lambda opt: [
-    #         n_heads * n_rows * ctx.block_size,
-    #         M,
-    #     ]
-    #     softmax_backward_kernel[grid](
-    #         x,
-    #         ctx.scale,
-    #         dx,
-    #         lut,
-    #         ctx.maxlut,
-    #         x.stride(0),
-    #         dx.stride(0),
-    #         force_nc_cache=True,
-    #         BLOCK=ctx.block_size,
-    #     )
-    #     return (
-    #         dx,
-    #         None,
-    #         None,
-    #         None,
-    #         None,
-    #         None,
-    #         None,
-    #         None,
-    #         None,
-    #         None,
-    #         None,
-    #         None,
-    #         None,
-    #         None,
-    #         None,
-    #     )
-
 
 class BlocksparseSoftmax:
     @lru_cache
@@ -362,7 +271,6 @@ class BlocksparseSoftmax:
         return make_index_mapping(self.block_mask)
 
     def __init__(self, block_mask: torch.Tensor, block_size: int):
-        self.n_heads, self.n_rows, _ = block_mask.shape
         self.block_mask = block_mask
         self.block_size = block_size
 
@@ -380,6 +288,8 @@ class BlocksparseSoftmax:
         if key_padding_mask is not None and key_padding_mask.dtype != x.dtype:
             raise ValueError("Key padding mask must be %s" % x.dtype)
         lut, max_lut = self.make_index_mapping()
+        n_heads = self.block_mask.shape[0]
+        n_rows = self.block_mask.shape[1] * self.block_size
         x = BlocksparseSoftmaxFunction.apply(
             x,
             scale,
@@ -390,8 +300,8 @@ class BlocksparseSoftmax:
             self.block_size,
             lut,
             max_lut,
-            self.n_heads,
-            self.n_rows,
+            n_heads,
+            n_rows,
         )
         return x
 
@@ -404,7 +314,7 @@ def make_index_mapping(block_mask: torch.Tensor) -> Tuple[torch.Tensor, int]:
     1. block_idx: which block we are processing. This is just an arange
     2. indices for the nonzero blocks. These are flattened out to being
         all the column indices then all the row indices then all the head indices.
-    3. TODO: Figure this out
+    3. TODO: Figure out what the header is
 
     :param block_mask: The block mask. Has shape (n_heads, n_blocks, n_blocks)
     :returns: Tuple of a tensor containing
